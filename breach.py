@@ -2,6 +2,7 @@ import socket
 import select
 import logging
 import binascii
+import ssl
 
 #TLS Header
 TLS_HEADER_LENGTH = 5
@@ -43,8 +44,8 @@ past_bytes_user = 0 #Number of bytes expanding to future packets
 past_bytes_endpoint = 0
 
 #Logger setup
-#logging.basicConfig(filename="breach.log") #Log in file
-logging.basicConfig()
+logging.basicConfig(filename="breach.log") #Log in file
+#logging.basicConfig()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -105,16 +106,19 @@ def parse(data, past_bytes_endpoint, past_bytes_user, is_response = False):
             if (cont_type == 23):
                     print("User application payload: %d" % length)
             lg.append("Source : User")
+    lg.append("Packet Data length: %d\n" % len(data))
     try:
         lg.append("Content Type : " + TLS_CONTENT[cont_type])
     except:
-        lg.append("Content Type: Unassigned %d" % cont_type)
+        pass
+#        lg.append("Content Type: Unassigned %d" % cont_type)
     try:
         lg.append("TLS Version : " + TLS_VERSION[(version[0], version[1])])
+        length = 1000000
+        lg.append("Payload Length: %d" % length)
     except:
-        lg.append("TLS Version: Uknown %d %d" % (version[0], version[1]))
-    lg.append("Payload Length: %d" % length)
-    lg.append("Packet Data length: %d\n" % len(data))
+        pass
+#        lg.append("TLS Version: Uknown %d %d" % (version[0], version[1]))
     
     #Check if TLS record spans to next TCP segment
     if (len(data)<length):
@@ -163,9 +167,12 @@ def restart():
 
     logger.info("Proxy has restarted")
 
+def endpoint_ssl_setup(endpoint_socket):
+    endpoint_ssl_socket = ssl.wrap_socket(endpoint_socket) #No server certificate required, so we don't verify endpoint certificate
+
 #Create and configure user side socket
 def user_setup():
-    global user_socket, user_connection, address
+    global user_ssl_socket, address
 
     logger.info("Setting up user socket")
     user_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -175,43 +182,62 @@ def user_setup():
     user_socket.listen(1)
     logger.info("User socket listen complete")
     user_connection, address = user_socket.accept()
+    logger.info("User socket SSL wrapper")
+    user_ssl_socket = ssl.wrap_socket( #Wrap existing socket in SSL, with self-signed certificate
+                                      user_connection, 
+                                      server_side = True, 
+                                      certfile = "server.crt",
+                                      keyfile = "server.key"
+                                     )
     logger.info("User socket is set up")
 
 #Create and configure endpoint side socket
 def endpoint_setup():
-    global endpoint_socket
+    global endpoint_ssl_socket
 
     logger.info("Setting up endpoint socket")
     endpoint_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    logger.info("Connecting endpoint socket")
-    endpoint_socket.connect((ENDPOINT, ENDPOINT_PORT))
-    endpoint_socket.setblocking(0) #Set non-blocking, i.e. raise exception if send/recv is not completed
+    logger.info("Creating ssl endpoint socket")
+    endpoint_ssl_socket = ssl.wrap_socket(endpoint_socket) #No server certificate required, so we don't verify endpoint
+    logger.info("Connecting ssl endpoint socket")
+    endpoint_ssl_socket.connect((ENDPOINT, ENDPOINT_PORT))
+    endpoint_ssl_socket.setblocking(0) #Set non-blocking, i.e. raise exception if send/recv is not completed
     logger.info("Endpoint socket is set up")
+    while 1: #Handshake will be non-blocking, retry until successful
+        try:
+            endpoint_ssl_socket.do_handshake()
+            break
+        except ssl.SSLWantReadError:
+            select.select([endpoint_ssl_socket], [], [])
+        except ssl.SSLWantWriteError:
+            select.select([], [endpoint_ssl_socket], [])
+    logger.info("Endpoint handshake complete")
 
 #Start proxy and execute main loop
 start()
 logger.info("Starting main proxy loop")
 while 1:
     ready_to_read, ready_to_write, in_error = select.select(
-                                                            [user_connection, endpoint_socket], 
+                                                            [user_ssl_socket, endpoint_ssl_socket], 
                                                             [], 
                                                             [], 
                                                             5
                                                            )
 
-    if user_connection in ready_to_read: #If user side socket is ready to read...
+    if user_ssl_socket in ready_to_read: #If user side socket is ready to read...
             data = ""
 
             try:
-                data = user_connection.recv(data_buff) #...receive data from user...
+                data = user_ssl_socket.recv(data_buff) #...receive data from user...
             except Exception as exc:
                 logger.error("User connection error")
-                logger.error(type(exc) + "\n" + exc.args + "\n" + exc)
+                logger.error(exc)
                 restart()
 
             if (len(data)==0):
-                    logger.info("User connection closed")
-                    restart()
+                     continue
+#                    logger.info("User connection closed - EOF")
+#                    restart()
             else:
                     output, past_bytes_endpoint, past_bytes_user = parse(
                                                                          data, 
@@ -220,26 +246,33 @@ while 1:
                                                                         ) #...parse it...
                     logger.debug(output)
                     try:
-                        endpoint_socket.sendall(data) #...and send it to endpoint
+                        endpoint_ssl_socket.sendall(data) #...and send it to endpoint
                     except Exception as exc:
                         logger.error("User data forwarding error")
-                        logger.error(type(exc) + "\n" + exc.args + "\n" + exc)
+                        logger.error(exc)
                         restart()
 
-    if endpoint_socket in ready_to_read: #Same for the endpoint side
+    if endpoint_ssl_socket in ready_to_read: #Same for the endpoint side
             data = ""
 
             try:
-                data = endpoint_socket.recv(data_buff)
+                data = endpoint_ssl_socket.recv(data_buff)
             except Exception as exc:
-                logger.error("Endpoint connection error")
-                logger.error(type(exc) + "\n" + exc.args + "\n" + exc)
-                restart()
-
-            if (len(data)==0):
-                    logger.info("Endpoint connection closed")
+                if exc.errno != ssl.SSL_ERROR_WANT_READ: #Ignore the want_read error, but raise others
+                    logger.error("Endpoint connection error")
+                    logger.error(exc)
                     restart()
+                continue
+            
+            if (len(data)==0):
+                     continue
+#                    logger.info("Endpoint connection closed - EOF")
+#                    restart()
             else:
+                    data_left = endpoint_ssl_socket.pending() #pending() gives buffered data that the SSL socket holds
+                    while data_left: #Drain the socket's buffer from data, due to non-blocking
+                        data = data + endpoint_ssl_socket.recv(data_left)
+                        data_left = endpoint_ssl_socket.pending()
                     output, past_bytes_endpoint, past_bytes_user = parse(
                                                                          data, 
                                                                          past_bytes_endpoint, 
@@ -248,13 +281,13 @@ while 1:
                                                                         )
                     logger.debug(output)
                     try:
-                        user_connection.sendall(data)
+                        user_ssl_socket.sendall(data)
                     except Exception as exc:
                         logger.error("Endpoint data forwarding error")
-                        logger.error(type(exc) + "\n" + exc.args + "\n" + exc)
+                        logger.error(exc)
                         restart()
 
 #Close sockets to terminate connection
-user_connection.close()
+user_ssl_socket.close()
 endpoint_socket.close()
 logger.info("Connection closed")

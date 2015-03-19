@@ -9,3 +9,4 @@ Current Version:
 	TLS Packet Sniffing
 	Separation of multiple TLS records in the same TCP segment
 	Reassembly of TLS records spanning multiple TCP segments
+	TLS decryption
